@@ -1,0 +1,10 @@
+[project]
+name = "mcp-flashcards-cloud"
+version = "0.1.0"
+description = "Hosted, multi-user flashcards MCP server with OAuth sign-in and per-user data isolation."
+requires-python = ">=3.12"
+dependencies = ["mcp==2.3.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

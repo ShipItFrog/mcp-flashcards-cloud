@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest==8.4.2
+# used directly by the tests (also installed with mcp; pinned here so test setup is explicit)
+httpx2==2.13.1
+anyio==4.15.1
