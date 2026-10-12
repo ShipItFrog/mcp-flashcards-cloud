@@ -1,9 +1,11 @@
 """Test helpers: a fake token verifier, and ways to talk to the real ASGI app over
 HTTP in-process (no network), as different users.
 
-The fake verifier stands in for the real one (which checks a JWT's signature,
-issuer, audience and expiry). Everything after it - the SDK's auth middleware,
-the MCP protocol, the tools and the database - is the real code.
+The fake verifier maps test tokens straight to users, so the isolation tests can
+focus on what happens after sign-in. The real verifier (signature, issuer,
+audience, expiry) is tested with real signed JWTs in test_verifier.py and
+test_jwt_end_to_end.py. Everything after the verifier - the SDK's auth
+middleware, the MCP protocol, the tools and the database - is the real code.
 """
 
 from __future__ import annotations
@@ -74,11 +76,17 @@ TRANSPORTS = [
 
 
 @asynccontextmanager
-async def running_app(store, *, stateless: bool = False, rate_limit: tuple[int, float] | None = None):
+async def running_app(
+    store,
+    *,
+    stateless: bool = False,
+    rate_limit: tuple[int, float] | None = None,
+    token_verifier: TokenVerifier | None = None,
+):
     extra = {} if rate_limit is None else {"rate_limit": rate_limit}
     mcp = create_server(
         store=store,
-        token_verifier=FakeVerifier(),
+        token_verifier=token_verifier or FakeVerifier(),
         issuer_url=ISSUER,
         resource_url=RESOURCE,
         required_scopes=[SCOPE],
@@ -88,6 +96,16 @@ async def running_app(store, *, stateless: bool = False, rate_limit: tuple[int, 
     # ASGITransport doesn't run the app's lifespan, so start the session manager here.
     async with mcp.session_manager.run():
         yield app
+
+
+# For raw HTTP requests (status codes and headers), without an MCP client in between.
+INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "raw-test", "version": "0"}},
+}
+HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 
 
 @asynccontextmanager

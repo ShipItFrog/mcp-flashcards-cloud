@@ -8,13 +8,20 @@ Every mutation must make at least one test fail.
 
 from __future__ import annotations
 
+import anyio
+import jwt
 from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
 
+from flashcards_cloud import app as app_module
 from flashcards_cloud import server
 from flashcards_cloud import store as store_module
+from flashcards_cloud import verifier as verifier_module
 
+A = app_module
 S = store_module
+V = verifier_module
 
 
 def _shared_deck(issuer: str) -> str:
@@ -85,6 +92,248 @@ def _auth_without_audience_check(**kwargs):
     return AuthSettings(**kwargs)
 
 
+# --- the real JWT verifier ---
+
+
+def _decode_without_signature(self, token):
+    """Reads the token without checking its signature (every claim is still checked)."""
+    return jwt.decode(
+        token,
+        issuer=self.issuer,
+        audience=self.audience,
+        leeway=V.LEEWAY_SECONDS,
+        options={
+            "verify_signature": False,
+            **dict.fromkeys(["verify_exp", "verify_nbf", "verify_iat", "verify_iss", "verify_aud", "verify_sub"], True),
+            "require": V.REQUIRED_CLAIMS,
+        },
+    )
+
+
+def _decode_any_audience(self, token):
+    """Forgot the audience check: accepts tokens the provider issued for other servers."""
+    key = self._keys.get_signing_key_from_jwt(token)
+    return jwt.decode(
+        token, key, algorithms=V.ALGORITHMS, issuer=self.issuer, leeway=V.LEEWAY_SECONDS,
+        options={"verify_aud": False, "require": ["iss", "sub", "exp"]},
+    )
+
+
+def _decode_any_issuer(self, token):
+    """Forgot the issuer check."""
+    key = self._keys.get_signing_key_from_jwt(token)
+    return jwt.decode(
+        token, key, algorithms=V.ALGORITHMS, audience=self.audience, leeway=V.LEEWAY_SECONDS,
+        options={"require": V.REQUIRED_CLAIMS},
+    )
+
+
+def _decode_ignoring_expiry(self, token):
+    """Forgot the expiry check."""
+    key = self._keys.get_signing_key_from_jwt(token)
+    return jwt.decode(
+        token, key, algorithms=V.ALGORITHMS, issuer=self.issuer, audience=self.audience, leeway=V.LEEWAY_SECONDS,
+        options={"verify_exp": False, "require": ["iss", "sub", "aud"]},
+    )
+
+
+async def _verify_subject_optional(self, token):
+    """Accepts a token that doesn't name a user."""
+
+    def decode():
+        key = self._keys.get_signing_key_from_jwt(token)
+        return jwt.decode(
+            token, key, algorithms=V.ALGORITHMS, issuer=self.issuer, audience=self.audience,
+            leeway=V.LEEWAY_SECONDS, options={"require": ["iss", "aud", "exp"]},
+        )
+
+    try:
+        claims = await anyio.to_thread.run_sync(decode)
+    except Exception:
+        return None
+    return AccessToken(
+        token=token, client_id="", scopes=V._scopes(claims), expires_at=int(claims["exp"]),
+        resource=self.audience, subject=claims.get("sub"), claims={"iss": claims["iss"], "sub": claims.get("sub")},
+    )
+
+
+def _init_without_key_cache(self, *, issuer, audience, jwks_url):
+    """Fetches the provider's keys on every request, so junk tokens make it flood the provider."""
+    self.issuer = issuer
+    self.audience = audience
+    self._keys = jwt.PyJWKClient(
+        jwks_url, cache_jwk_set=False, timeout=V.KEYS_FETCH_TIMEOUT_SECONDS, headers={"User-Agent": V.USER_AGENT}
+    )
+
+
+def _init_with_default_user_agent(self, *, issuer, audience, jwks_url):
+    """Fetches keys with Python's default User-Agent, which Descope's endpoint refuses."""
+    self.issuer = issuer
+    self.audience = audience
+    self._keys = jwt.PyJWKClient(jwks_url, lifespan=V.KEYS_CACHE_SECONDS, timeout=V.KEYS_FETCH_TIMEOUT_SECONDS)
+
+
+def _rs256_only(mp):
+    """Hard-codes RS256, as Descope's metadata suggests, though a project run by Descope itself signs with ES384."""
+    mp.setattr(V, "ALGORITHMS", ["RS256"])
+
+
+def _unverified(token):
+    return jwt.decode(token, options={"verify_signature": False})
+
+
+def _rewrap_verify_token(mp, change):
+    """Run the real verify_token, then apply `change(result, claims)` to what it accepted."""
+    original = V.JwtTokenVerifier.verify_token
+
+    async def patched(self, token):
+        result = await original(self, token)
+        return change(result, _unverified(token)) if result is not None else None
+
+    mp.setattr(V.JwtTokenVerifier, "verify_token", patched)
+
+
+def _resource_from_first_aud(mp):
+    """Takes the resource from the token's aud (its first entry) instead of the configured URL."""
+    _rewrap_verify_token(
+        mp, lambda r, c: r.model_copy(update={"resource": c["aud"] if isinstance(c["aud"], str) else c["aud"][0]})
+    )
+
+
+def _client_id_without_azp(mp):
+    """Reads the client ID only from client_id, which Descope's tokens don't have."""
+    _rewrap_verify_token(mp, lambda r, c: r.model_copy(update={"client_id": str(c.get("client_id") or "")}))
+
+
+def _scope_not_split(claims):
+    """Treats the space-separated scope string as one scope."""
+    scope = claims.get("scope")
+    return [scope] if isinstance(scope, str) else (scope or [])
+
+
+def _token_logged_on_mismatch(mp):
+    """Logs the token itself when explaining an issuer or audience mismatch."""
+    original = V._claimed
+
+    def patched(token):
+        V.logger.info("mismatched token: %s", token)
+        return original(token)
+
+    mp.setattr(V, "_claimed", patched)
+
+
+def _token_in_fetch_error(mp):
+    """Puts the token into the key-fetch error, which then lands in the warning."""
+    original = V.JwtTokenVerifier._decode
+
+    def patched(self, token):
+        try:
+            return original(self, token)
+        except jwt.PyJWKClientConnectionError as e:
+            raise jwt.PyJWKClientConnectionError(f"{e} (token {token})") from e
+
+    mp.setattr(V.JwtTokenVerifier, "_decode", patched)
+
+
+class _InlineAnyio:
+    """anyio stand-in whose to_thread.run_sync runs the function on the event loop."""
+
+    class to_thread:
+        @staticmethod
+        async def run_sync(fn, *args):
+            return fn(*args)
+
+
+def _dsub_ignored(mp):
+    """Ignores dsub, so a customized sub is trusted as the user's ID."""
+    original = V.JwtTokenVerifier._decode
+
+    def patched(self, token):
+        claims = original(self, token)
+        claims.pop("dsub", None)
+        return claims
+
+    mp.setattr(V.JwtTokenVerifier, "_decode", patched)
+
+
+def _token_type_ignored(mp):
+    """Accepts the same provider's refresh and ID tokens as access tokens."""
+    original = V._kind_problem
+    mp.setattr(V, "_kind_problem", lambda claims: original({k: v for k, v in claims.items() if k != "token_type"}))
+
+
+def _lifetime_capped_only_with_iat(mp):
+    """Checks the lifetime only when the token says when it was issued."""
+    original = V._kind_problem
+    mp.setattr(V, "_kind_problem", lambda claims: original(claims) if "iat" in claims else "")
+
+
+def _lifetime_counted_from_now(mp):
+    """Counts the lifetime from now, so a long-lived token close to expiry passes."""
+    original = V._kind_problem
+    mp.setattr(V, "_kind_problem", lambda claims: original({k: v for k, v in claims.items() if k != "iat"}))
+
+
+def _empty_token_type_allowed(mp):
+    """Treats a null or empty token_type as no token_type at all."""
+    original = V._kind_problem
+    mp.setattr(
+        V, "_kind_problem",
+        lambda claims: original({k: v for k, v in claims.items() if k != "token_type" or v}),
+    )
+
+
+def _lenient_url(env, name, errors):
+    """The first version's URL check: present, http(s), https unless local. No standard form."""
+    value = env.get(name, "").strip()
+    if not value:
+        errors.append(f"{name} is missing")
+        return value
+    parts = A.urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        errors.append(f"{name} must be a full URL")
+    elif parts.scheme == "http" and parts.hostname not in A.LOCAL_HOSTS:
+        errors.append(f"{name} must use https")
+    return value
+
+
+async def _guard_allows_any_method(self, scope, receive, send):
+    """The guard still names the scope in challenges, but lets GET through again."""
+    if scope["type"] == "http" and scope["path"] == self.path and scope["method"] != "POST":
+        await self.app(scope, receive, send)
+        return
+    await _ORIGINAL_GUARD_CALL(self, scope, receive, send)
+
+
+_ORIGINAL_GUARD_CALL = A.McpEndpointGuard.__call__
+
+
+def _challenge_without_scope(mp):
+    """401 and 403 challenges no longer name the required scope."""
+    original = A.McpEndpointGuard.__init__
+
+    def patched(self, app, *, path, scopes):
+        original(self, app, path=path, scopes=scopes)
+        self.scope_param = b""
+
+    mp.setattr(A.McpEndpointGuard, "__init__", patched)
+
+
+class _ServerWithListen(server.MCPServer):
+    """Leaves subscriptions/listen on (the SDK default)."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.pop("subscriptions", None)
+        super().__init__(*args, **kwargs)
+
+
+class _StatefulServer(server.MCPServer):
+    """Runs the app with per-connection sessions, which have a global cap."""
+
+    def streamable_http_app(self, **kwargs):
+        return super().streamable_http_app(**{**kwargs, "stateless_http": False})
+
+
 MUTATIONS = {
     "shared-deck": lambda mp: mp.setattr(server, "current_owner", _shared_deck),
     "key-by-client-id": lambda mp: mp.setattr(server, "current_owner", _key_by_client_id),
@@ -96,4 +345,33 @@ MUTATIONS = {
     "unpaginated-list": lambda mp: mp.setattr(S.SqliteCardStore, "_list", _list_unpaginated),
     "topic-not-normalized": lambda mp: mp.setattr(S, "topic_key", lambda topic: topic),
     "no-rate-limit": lambda mp: mp.setattr(server.RateLimiter, "check", lambda self, key: None),
+    "jwt-signature-not-checked": lambda mp: mp.setattr(V.JwtTokenVerifier, "_decode", _decode_without_signature),
+    "jwt-audience-not-checked": lambda mp: mp.setattr(V.JwtTokenVerifier, "_decode", _decode_any_audience),
+    "jwt-issuer-not-checked": lambda mp: mp.setattr(V.JwtTokenVerifier, "_decode", _decode_any_issuer),
+    "jwt-expiry-not-checked": lambda mp: mp.setattr(V.JwtTokenVerifier, "_decode", _decode_ignoring_expiry),
+    "jwt-subject-optional": lambda mp: mp.setattr(V.JwtTokenVerifier, "verify_token", _verify_subject_optional),
+    "jwt-keys-not-cached": lambda mp: mp.setattr(V.JwtTokenVerifier, "__init__", _init_without_key_cache),
+    "jwt-default-user-agent": lambda mp: mp.setattr(V.JwtTokenVerifier, "__init__", _init_with_default_user_agent),
+    "jwt-rs256-only": _rs256_only,
+    "jwt-resource-from-first-aud": _resource_from_first_aud,
+    "jwt-scope-not-split": lambda mp: mp.setattr(V, "_scopes", _scope_not_split),
+    "jwt-client-id-without-azp": _client_id_without_azp,
+    "jwt-token-logged-on-mismatch": _token_logged_on_mismatch,
+    "jwt-token-in-fetch-error": _token_in_fetch_error,
+    "jwt-decode-on-event-loop": lambda mp: mp.setattr(V, "anyio", _InlineAnyio),
+    "jwt-dsub-ignored": _dsub_ignored,
+    "jwt-key-errors-look-like-token-errors": lambda mp: mp.setattr(V, "UNKNOWN_KEY_ID", ""),
+    "jwt-token-type-ignored": _token_type_ignored,
+    "jwt-lifetime-uncapped": lambda mp: mp.setattr(V, "MAX_LIFETIME_SECONDS", 10**12),
+    "jwt-lifetime-capped-only-with-iat": _lifetime_capped_only_with_iat,
+    "jwt-lifetime-counted-from-now": _lifetime_counted_from_now,
+    "jwt-empty-token-type-allowed": _empty_token_type_allowed,
+    "app-urls-not-standard-form": lambda mp: mp.setattr(A, "_url", _lenient_url),
+    "app-key-url-on-any-host": lambda mp: mp.setattr(A, "_same_host", lambda url, other: True),
+    "app-get-allowed": lambda mp: mp.setattr(A.McpEndpointGuard, "__call__", _guard_allows_any_method),
+    "app-challenge-without-scope": _challenge_without_scope,
+    "app-listen-enabled": lambda mp: mp.setattr(server, "MCPServer", _ServerWithListen),
+    "app-stateful": lambda mp: mp.setattr(server, "MCPServer", _StatefulServer),
+    "app-default-keep-alive": lambda mp: mp.setattr(A, "KEEP_ALIVE_SECONDS", 5),
+    "app-no-connection-limit": lambda mp: mp.setattr(A, "MAX_CONNECTIONS", None),
 }

@@ -2,17 +2,10 @@
 through an MCP client, so the client can't hide or retry anything."""
 
 import pytest
-from helpers import BASE, ISSUER, RESOURCE, http, running_app
+from helpers import BASE, HEADERS, INITIALIZE, ISSUER, RESOURCE, http, running_app
 
 pytestmark = pytest.mark.anyio
 
-INITIALIZE = {
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "initialize",
-    "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "raw-test", "version": "0"}},
-}
-HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 # The auth check runs before the server looks at which protocol generation a request
 # uses; check both anyway, so a regression on either path shows up.
 PROTOCOL_HEADERS = {"legacy": {}, "modern": {"MCP-Protocol-Version": "2026-07-28"}}

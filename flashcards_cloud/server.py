@@ -100,11 +100,15 @@ def create_server(
     mcp = MCPServer(
         name="flashcards-cloud",
         instructions=INSTRUCTIONS,
+        # Nothing here changes on its own, so there is nothing to subscribe to; the
+        # 2026-07-28 subscriptions/listen stream would only be held open for nothing.
+        subscriptions=False,
         token_verifier=token_verifier,
         auth=AuthSettings(
             issuer_url=issuer_url,
             resource_server_url=resource_url,
-            required_scopes=required_scopes or [],
+            # None rather than [] so the metadata leaves out scopes_supported entirely.
+            required_scopes=required_scopes or None,
             # Only accept tokens issued for this server (RFC 8707). Set explicitly:
             # the SDK default changes in a future major version.
             validate_token_resource=True,

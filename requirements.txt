@@ -1,1 +1,8 @@
+# Everything the server code imports directly, pinned to the versions it was tested with.
 mcp==2.3.0
+anyio==4.15.1
+pydantic==2.13.5
+PyJWT[crypto]==2.15.1
+cryptography==50.0.2
+starlette==1.7.0
+uvicorn==0.54.0
