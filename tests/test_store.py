@@ -1,5 +1,7 @@
 """The storage layer on its own: every method is scoped to its owner."""
 
+import threading
+
 import anyio
 import pytest
 
@@ -95,3 +97,47 @@ async def test_list_pages_by_card_number(store):
     assert [c["id"] for c in await store.list(ALICE, limit=2)] == [1, 2]
     assert [c["id"] for c in await store.list(ALICE, limit=2, after_id=2)] == [3, 4]
     assert [c["id"] for c in await store.list(ALICE, limit=2, after_id=4)] == [5]
+
+
+async def test_a_refused_add_does_not_use_up_a_number(store, monkeypatch):
+    monkeypatch.setattr(store_module, "MAX_CARDS_PER_OWNER", 2)
+    await store.add(ALICE, "q1", "a", "t")
+    await store.add(ALICE, "q2", "a", "t")
+    with pytest.raises(CardLimitError):
+        await store.add(ALICE, "q3", "a", "t")
+    assert await store.delete(ALICE, 2)
+    assert (await store.add(ALICE, "q4", "a", "t"))["id"] == 3
+
+
+async def test_store_calls_run_off_the_event_loop(store, monkeypatch):
+    # A slow database must not freeze every other request on this single-process server.
+    threads = []
+    original = type(store)._count
+
+    def counting(self, owner, topic):
+        threads.append(threading.get_ident())
+        return original(self, owner, topic)
+
+    monkeypatch.setattr(type(store), "_count", counting)
+    await store.count(ALICE)
+    assert threads and threading.get_ident() not in threads
+
+
+async def test_cards_look_the_same_in_both_databases(store, monkeypatch):
+    monkeypatch.setattr(store_module, "_now", lambda: "2026-01-01T00:00:00+00:00")
+    expected = {
+        "id": 1, "question": "q", "answer": "a", "topic": "t", "created_at": "2026-01-01T00:00:00+00:00",
+        "last_reviewed": None, "review_count": 0, "correct_count": 0, "wrong_count": 0,
+    }
+    card = await store.add(ALICE, "q", "a", "t")
+    assert card == expected
+    assert {k: type(v) for k, v in card.items()} == {k: type(v) for k, v in expected.items()}
+    assert await store.list(ALICE) == [expected]
+    graded = await store.record_review(ALICE, 1, False)
+    assert graded == {**expected, "last_reviewed": "2026-01-01T00:00:00+00:00", "review_count": 1, "wrong_count": 1}
+
+
+async def test_the_largest_card_number_is_simply_not_found(store):
+    await store.add(ALICE, "q", "a", "t")
+    assert await store.record_review(ALICE, 2**53, True) is None
+    assert await store.delete(ALICE, 2**53) is False

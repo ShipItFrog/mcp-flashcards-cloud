@@ -22,7 +22,14 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from .identity import current_owner
-from .store import MAX_CARDS_PER_OWNER, MAX_CHARS_PER_OWNER, CardLimitError, CardStore
+from .store import (
+    MAX_CARDS_PER_OWNER,
+    MAX_CHARS_PER_OWNER,
+    CardLimitError,
+    CardStore,
+    StoreFullError,
+    StoreUnavailableError,
+)
 
 MAX_QUESTION = 500
 MAX_ANSWER = 1000
@@ -45,16 +52,24 @@ INSTRUCTIONS = (
 )
 
 
+def _check_characters(value: str, field: str) -> None:
+    """Text both databases can store: valid UTF-8 (no lone surrogates) and no NUL,
+    which Postgres text can't hold."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ToolError(f"{field} contains invalid characters") from None
+    if "\x00" in value:
+        raise ToolError(f"{field} contains invalid characters")
+
+
 def _text(value: str, field: str, limit: int) -> str:
     value = value.strip()
     if not value:
         raise ToolError(f"{field} must not be empty")
     if len(value) > limit:
         raise ToolError(f"{field} is too long (max {limit} characters)")
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        raise ToolError(f"{field} contains invalid characters") from None
+    _check_characters(value, field)
     return value
 
 
@@ -63,7 +78,18 @@ def _topic_filter(topic: str) -> str:
     topic = topic.strip()
     if len(topic) > MAX_TOPIC:
         raise ToolError(f"topic is too long (max {MAX_TOPIC} characters)")
+    _check_characters(topic, "topic")
     return topic
+
+
+async def _stored(call):
+    """Await a store call; a database problem becomes a message the user can act on."""
+    try:
+        return await call
+    except StoreUnavailableError:
+        raise ToolError("The card database is temporarily unavailable. Please try again in a minute.") from None
+    except StoreFullError:
+        raise ToolError("The card database is out of space. Please let the server's owner know.") from None
 
 
 class RateLimiter:
@@ -129,7 +155,7 @@ def create_server(
         a = _text(answer, "answer", MAX_ANSWER)
         t = _text(topic, "topic", MAX_TOPIC)
         try:
-            card = await store.add(who, q, a, t)
+            card = await _stored(store.add(who, q, a, t))
         except CardLimitError:
             raise ToolError(
                 f"Deck is full (max {MAX_CARDS_PER_OWNER} cards or {MAX_CHARS_PER_OWNER:,} characters). "
@@ -144,10 +170,10 @@ def create_server(
         who = owner()
         t = _topic_filter(topic)
         # Fetch one extra card only to learn whether another page exists.
-        cards = await store.list(who, t, limit + 1, after_id)
+        cards = await _stored(store.list(who, t, limit + 1, after_id))
         has_more = len(cards) > limit
         cards = cards[:limit]
-        total = await store.count(who, t)
+        total = await _stored(store.count(who, t))
         next_after_id = cards[-1]["id"] if has_more else None
         return {"ok": True, "total": total, "count": len(cards), "cards": cards, "next_after_id": next_after_id}
 
@@ -156,7 +182,7 @@ def create_server(
         """Draw the card you have gone longest without reviewing. Returns the question
         only, never the answer."""
         who = owner()
-        card = await store.least_recently_reviewed(who, _topic_filter(topic))
+        card = await _stored(store.least_recently_reviewed(who, _topic_filter(topic)))
         if card is None:
             return {"ok": True, "card_id": None, "message": "No cards to review"}
         return {
@@ -170,7 +196,7 @@ def create_server(
     @mcp.tool()
     async def grade_card(card_id: CardId, correct: bool) -> dict[str, Any]:
         """Record a right or wrong answer and update the card's review time."""
-        card = await store.record_review(owner(), card_id, correct)
+        card = await _stored(store.record_review(owner(), card_id, correct))
         if card is None:
             # Same message whether the card doesn't exist or belongs to someone
             # else, so the reply never reveals another user's card numbers.
@@ -180,7 +206,7 @@ def create_server(
     @mcp.tool()
     async def delete_card(card_id: CardId) -> dict[str, Any]:
         """Delete one of your cards."""
-        if not await store.delete(owner(), card_id):
+        if not await _stored(store.delete(owner(), card_id)):
             raise ToolError(f"No card with id {card_id}")
         return {"ok": True, "message": f"Deleted card #{card_id}"}
 

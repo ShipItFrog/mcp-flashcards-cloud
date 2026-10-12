@@ -3,8 +3,11 @@ name = "mcp-flashcards-cloud"
 version = "0.1.0"
 description = "Hosted, multi-user flashcards MCP server with OAuth sign-in and per-user data isolation."
 requires-python = ">=3.12"
-dependencies = ["mcp==2.3.0"]
+dependencies = ["mcp==2.3.0", "PyJWT[crypto]==2.15.1", "psycopg[binary,pool]==3.3.6", "psycopg-pool==3.3.3"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# -rs lists every skipped test and why, so a skipped Postgres run is never mistaken for a pass.
+addopts = "-rs"
+markers = ["postgres: runs against a local Postgres server (skipped if none is available)"]

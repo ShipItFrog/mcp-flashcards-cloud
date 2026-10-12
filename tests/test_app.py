@@ -12,6 +12,7 @@ import anyio
 import httpx2
 import jwt
 import pytest
+import uvicorn
 from helpers import HEADERS, INITIALIZE
 from jwt_helpers import DROP, JWKS, JsonServer, sign
 
@@ -179,6 +180,25 @@ async def test_subscriptions_are_not_offered(tmp_path, keys):
     assert listen.json()["error"]["code"] == -32601  # method not found
 
 
+@pytest.mark.parametrize(
+    ("allowed", "origin", "status"),
+    [
+        ("", "https://claude.ai", 403),
+        ("https://claude.ai", "https://claude.ai", 200),
+        ("https://claude.ai https://claude.com", "https://claude.com", 200),
+        ("https://claude.ai", "https://evil.example.test", 403),
+    ],
+    ids=["not-listed", "listed", "second-listed", "other-origin"],
+)
+async def test_signed_requests_from_listed_origins_are_served(tmp_path, keys, allowed, origin, status):
+    # The Origin check runs after sign-in: an unsigned request gets 401 whatever its
+    # Origin, so this is what a signed-in client sending an Origin header meets.
+    app = make_app(tmp_path, FLASHCARDS_ALLOWED_ORIGINS=allowed or None)
+    async with running(app), client(app, token=token()) as hc:
+        response = await hc.post("/mcp", json=INITIALIZE, headers={**HEADERS, "Origin": origin})
+    assert response.status_code == status
+
+
 async def test_a_trailing_slash_is_not_redirected(tmp_path):
     # Behind Render's proxy the redirect would point at plain http://.
     async with client(make_app(tmp_path)) as hc:
@@ -225,7 +245,16 @@ BAD_SETTINGS = {
     "port-out-of-range": {"PORT": "70000"},
     "port-zero": {"PORT": "0"},
     "unknown-log-level": {"LOG_LEVEL": "LOUD"},
+    # Render's disk is wiped on every restart: without Postgres every card would vanish.
+    "render-without-a-database": {"RENDER": "true"},
+    "postgres-and-sqlite-both-set": {"FLASHCARDS_DATABASE_URL": "postgresql://u:p@db.example.test/cards?sslmode=require"},
+    "empty-database-url": {"FLASHCARDS_DB": None, "FLASHCARDS_DATABASE_URL": "  "},
+    "origin-with-a-path": {"FLASHCARDS_ALLOWED_ORIGINS": "https://claude.ai/"},
+    "origin-upper-case": {"FLASHCARDS_ALLOWED_ORIGINS": "https://Claude.ai"},
+    "origin-without-scheme": {"FLASHCARDS_ALLOWED_ORIGINS": "claude.ai"},
 }
+
+REMOTE_DATABASE = {"FLASHCARDS_DB": None, "FLASHCARDS_DATABASE_URL": "postgresql://u:p@db.example.test/cards?sslmode=require"}
 
 
 @pytest.mark.parametrize("overrides", BAD_SETTINGS.values(), ids=BAD_SETTINGS.keys())
@@ -267,14 +296,88 @@ def test_server_limits(tmp_path):
     assert options["timeout_keep_alive"] > 75
     # A cap on simultaneous connections turns "out of memory" into "503 for some".
     assert options["limit_concurrency"]
+    assert options["workers"] == 1
     assert options["host"] == "127.0.0.1"
     assert "forwarded_allow_ips" not in options
 
 
 def test_on_render_listen_on_all_interfaces_and_trust_its_proxy(tmp_path):
-    options = server_options(load_settings(env(tmp_path, RENDER="true", PORT="10000")))
+    options = server_options(load_settings(env(tmp_path, RENDER="true", PORT="10000", **REMOTE_DATABASE)))
     assert options["host"] == "0.0.0.0" and options["port"] == 10000
     assert options["forwarded_allow_ips"] == "*"
+
+
+def test_one_process_whatever_web_concurrency_says(tmp_path, monkeypatch):
+    # Render sets WEB_CONCURRENCY; uvicorn reads it unless workers is given, and exits at
+    # startup when it is above 1 and the app is passed as an object. uvicorn's own Config
+    # decides, so ask it.
+    monkeypatch.setenv("WEB_CONCURRENCY", "2")
+    options = server_options(load_settings(env(tmp_path, RENDER="true", **REMOTE_DATABASE)))
+    assert uvicorn.Config(make_app(tmp_path), **options).workers == 1
+
+
+# --- the database setting ---
+
+
+SENTINEL = "pw-SENTINEL-4711"
+
+
+def test_a_remote_postgres_database_is_accepted_and_its_url_never_shown(tmp_path):
+    url = f"postgresql://cards:{SENTINEL}@db.example.test/cards?sslmode=require"
+    settings = load_settings(env(tmp_path, FLASHCARDS_DB=None, FLASHCARDS_DATABASE_URL=url))
+    assert settings.database_url == url and settings.db_path is None
+    assert SENTINEL not in repr(settings)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"postgresql://cards:{SENTINEL}@db.example.test/cards",  # remote without TLS
+        f"mysql://cards:{SENTINEL}@db.example.test/cards",
+        f"postgresql://cards:{SENTINEL}@/cards?sslmode=require",  # no host
+        f"postgresql://cards:{SENTINEL}@db.example.test:notaport/cards?sslmode=require",
+        # "localhost", but hostaddr sends libpq to a remote address
+        f"postgresql://cards:{SENTINEL}@localhost/cards?hostaddr=203.0.113.5",
+        # Unencoded @ / # in the password: libpq would read part of it as the host or the
+        # database name, and the log shows both.
+        f"postgresql://cards:{SENTINEL}@x@db.example.test/cards?sslmode=require",
+        f"postgresql://cards:12/{SENTINEL}@db.example.test/cards?sslmode=require",
+        f"postgresql://cards:{SENTINEL}#x@db.example.test/cards?sslmode=require",
+    ],
+    ids=["no-tls", "not-postgres", "no-host", "bad-port", "remote-hostaddr", "at-sign", "slash", "hash"],
+)
+def test_a_bad_database_url_is_refused_without_showing_it(tmp_path, url):
+    with pytest.raises(ConfigError) as stopped:
+        load_settings(env(tmp_path, FLASHCARDS_DB=None, FLASHCARDS_DATABASE_URL=url))
+    assert "FLASHCARDS_DATABASE_URL" in str(stopped.value)
+    assert SENTINEL not in str(stopped.value)
+
+
+def test_a_database_on_this_machine_needs_no_tls(tmp_path):
+    url = "postgresql://postgres@127.0.0.1:5432/postgres"
+    assert load_settings(env(tmp_path, FLASHCARDS_DB=None, FLASHCARDS_DATABASE_URL=url)).database_url == url
+
+
+def test_a_percent_encoded_password_is_fine(tmp_path):
+    url = "postgresql://cards:p%40ss%2Fw%23rd@db.example.test/cards?sslmode=require&channel_binding=require"
+    assert load_settings(env(tmp_path, FLASHCARDS_DB=None, FLASHCARDS_DATABASE_URL=url)).database_url == url
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["https://claude.ai:443", "https://claude.ai:abc", "https://@claude.ai", "https://*.example.test", "https://claude.ai/"],
+    ids=["default-port", "bad-port", "empty-user", "wildcard-host", "path"],
+)
+def test_an_origin_that_could_never_match_is_refused(tmp_path, origin):
+    # The SDK compares Origin headers exactly, so these would silently never match.
+    with pytest.raises(ConfigError, match="FLASHCARDS_ALLOWED_ORIGINS"):
+        load_settings(env(tmp_path, FLASHCARDS_ALLOWED_ORIGINS=origin))
+
+
+def test_an_any_port_origin_is_kept(tmp_path):
+    # The SDK supports "scheme://host:*" for any port.
+    allowed = "http://localhost:* https://claude.ai"
+    assert load_settings(env(tmp_path, FLASHCARDS_ALLOWED_ORIGINS=allowed)).allowed_origins == ["http://localhost:*", "https://claude.ai"]
 
 
 # --- startup check against the identity provider's metadata ---

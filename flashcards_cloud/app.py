@@ -1,8 +1,9 @@
 """The deployable app: settings checked before anything starts, the MCP endpoint
 answering only what it must, and server limits suited to free-tier hosting.
 
-Settings come from environment variables. None of them is a secret: the server
-only checks tokens with the identity provider's public keys.
+Settings come from environment variables. Only FLASHCARDS_DATABASE_URL is a secret
+(it holds the database password); tokens are checked with the identity provider's
+public keys.
 
   FLASHCARDS_ISSUER        the identity provider's issuer, copied exactly from its metadata
   FLASHCARDS_JWKS_URL      where the provider publishes its public signing keys (jwks_uri);
@@ -10,7 +11,12 @@ only checks tokens with the identity provider's public keys.
   FLASHCARDS_RESOURCE_URL  this server's MCP URL, exactly as users enter it in Claude and as
                            registered with the provider, e.g. https://example.onrender.com/mcp
   FLASHCARDS_SCOPES        optional: scopes every token must carry, e.g. "flashcards"
-  FLASHCARDS_DB            optional: SQLite file (default data/cards.db)
+  FLASHCARDS_DATABASE_URL  Postgres connection URL (secret), e.g. from Neon; required on Render.
+                           A remote database must use sslmode=require or stricter
+  FLASHCARDS_DB            optional, local use only: SQLite file (default data/cards.db);
+                           set this or FLASHCARDS_DATABASE_URL, not both
+  FLASHCARDS_ALLOWED_ORIGINS  optional: other web origins whose requests are accepted, e.g.
+                           "https://claude.ai" (requests without an Origin header always are)
   HOST, PORT               optional: where to listen (default 127.0.0.1 and 8000;
                            0.0.0.0 on Render, which sets RENDER=true)
   LOG_LEVEL                optional: DEBUG, INFO (default), WARNING or ERROR
@@ -25,7 +31,7 @@ import re
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -38,7 +44,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .server import create_server
-from .store import SqliteCardStore
+from .store import CardStore, PostgresCardStore, SqliteCardStore, StoreUnavailableError
 from .verifier import USER_AGENT, JwtTokenVerifier
 
 logger = logging.getLogger(__name__)
@@ -54,6 +60,10 @@ KEEP_ALIVE_SECONDS = 120
 # Most simultaneous connections; beyond this new ones get 503 instead of the instance
 # running out of memory.
 MAX_CONNECTIONS = 400
+# One process: the rate limiter and the database pool live in it. Written out because
+# uvicorn otherwise reads WEB_CONCURRENCY, which Render sets, and exits at startup when
+# that is above 1 and the app is passed as an object.
+WORKERS = 1
 
 
 class ConfigError(SystemExit):
@@ -73,11 +83,14 @@ class Settings:
     jwks_url: str
     resource_url: str
     scopes: list[str]
-    db_path: Path
+    db_path: Path | None
     host: str
     port: int
     log_level: str
     on_render: bool
+    allowed_origins: list[str] = field(default_factory=list)
+    # Holds the password: never shown, not even in repr() or error messages.
+    database_url: str | None = field(default=None, repr=False)
 
 
 def _url(env: Mapping[str, str], name: str, errors: list[str]) -> str:
@@ -113,6 +126,107 @@ def _same_host(url: str, other: str) -> bool:
     return urlsplit(url).hostname == urlsplit(other).hostname
 
 
+def _database_url(value: str, errors: list[str]) -> None:
+    """Check FLASHCARDS_DATABASE_URL without ever repeating it: it holds the password,
+    so no message here includes the value or the parser's own error text."""
+    name = "FLASHCARDS_DATABASE_URL"
+    if not value.strip():
+        errors.append(f"{name} is empty")
+        return
+    scheme, sep, rest = value.partition("://")
+    if not sep or scheme.lower() not in ("postgresql", "postgres"):
+        errors.append(f"{name} must be a postgresql:// URL (value not shown)")
+        return
+    # Characters such as @ / ? # in the password must be percent-encoded. Otherwise libpq
+    # reads part of the password as the host or the database name, which the log shows.
+    authority = re.split(r"[/?#]", rest, maxsplit=1)[0]
+    if value.count("@") != authority.count("@") or authority.count("@") > 1:
+        errors.append(f"{name}: characters such as @ / ? # in the password must be percent-encoded (value not shown)")
+        return
+    from psycopg.conninfo import conninfo_to_dict
+
+    try:
+        params = conninfo_to_dict(value)
+    except Exception:
+        errors.append(f"{name} is not a valid Postgres connection URL (value not shown)")
+        return
+    host = str(params.get("host") or "")
+    hostaddr = str(params.get("hostaddr") or "")
+    port = str(params.get("port") or "5432")
+    if not (port.isdigit() and 1 <= int(port) <= 65535):
+        errors.append(f"{name} has an invalid port (value not shown)")
+    if not host:
+        errors.append(f"{name} has no host (value not shown)")
+        return
+    if (urlsplit(value).hostname or "") != host.lower():
+        errors.append(f"{name}: characters such as @ / ? # in the password must be percent-encoded (value not shown)")
+        return
+    # hostaddr overrides where libpq actually connects, so "localhost" alone isn't proof.
+    local = host in LOCAL_HOSTS and hostaddr in ("", "127.0.0.1", "::1")
+    if not local and params.get("sslmode") not in ("require", "verify-ca", "verify-full"):
+        errors.append(f"{name} must use sslmode=require (or verify-ca / verify-full) for a remote database")
+
+
+def _database(env: Mapping[str, str], on_render: bool, errors: list[str]) -> tuple[str | None, Path | None]:
+    """Which database: Postgres (FLASHCARDS_DATABASE_URL) or a SQLite file (FLASHCARDS_DB)."""
+    database_url = env.get("FLASHCARDS_DATABASE_URL")
+    if database_url is not None:
+        _database_url(database_url, errors)
+        if "FLASHCARDS_DB" in env:
+            errors.append("Set FLASHCARDS_DATABASE_URL or FLASHCARDS_DB, not both")
+        return database_url, None
+    if on_render:
+        # Render's disk is wiped on every restart and deploy: a SQLite file there would
+        # silently lose every card.
+        errors.append("FLASHCARDS_DATABASE_URL is missing: on Render the cards must live in Postgres")
+        return None, None
+    db = env.get("FLASHCARDS_DB", "data/cards.db").strip()
+    if not db:
+        errors.append("FLASHCARDS_DB is empty")
+    return None, Path(db)
+
+
+def database_label(url: str) -> str:
+    """Which database a URL points at, for the log: the database name and host only."""
+    from psycopg.conninfo import conninfo_to_dict
+
+    params = conninfo_to_dict(url)
+    return f"{params.get('dbname') or '(default)'!r} on {params.get('host')!r}"
+
+
+def _standard_origin(origin: str) -> str | None:
+    """The origin as a browser would send it, or None if this isn't one. The SDK compares
+    Origin headers character by character, so only this spelling can ever match. A
+    trailing ':*' (any port) is kept: the SDK supports it."""
+    any_port = origin.endswith(":*")
+    parts = urlsplit(origin[:-2] if any_port else origin)
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    host = parts.hostname
+    if parts.scheme not in ("http", "https") or not host or "*" in host or "@" in parts.netloc:
+        return None
+    if parts.path or parts.query or parts.fragment:
+        return None
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None and port != {"http": 80, "https": 443}[parts.scheme]:
+        netloc += f":{port}"
+    return f"{parts.scheme}://{netloc}" + (":*" if any_port else "")
+
+
+def _origins(env: Mapping[str, str], errors: list[str]) -> list[str]:
+    """FLASHCARDS_ALLOWED_ORIGINS: web origins such as https://claude.ai, in standard form."""
+    origins = [o for o in re.split(r"[\s,]+", env.get("FLASHCARDS_ALLOWED_ORIGINS", "")) if o]
+    for origin in origins:
+        if _standard_origin(origin) != origin:
+            errors.append(
+                "FLASHCARDS_ALLOWED_ORIGINS needs origins written like 'https://claude.ai' "
+                f"(lower-case, no path, no default port): {origin!r}"
+            )
+    return origins
+
+
 def load_settings(env: Mapping[str, str]) -> Settings:
     """Read and check every setting, reporting all problems at once."""
     errors: list[str] = []
@@ -137,11 +251,10 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         elif not SCOPE_TOKEN.fullmatch(s):
             errors.append(f"FLASHCARDS_SCOPES has an invalid scope name: {s!r}")
 
-    db = env.get("FLASHCARDS_DB", "data/cards.db").strip()
-    if not db:
-        errors.append("FLASHCARDS_DB is empty")
-
     on_render = env.get("RENDER") == "true"
+    database_url, db_path = _database(env, on_render, errors)
+    allowed_origins = _origins(env, errors)
+
     host = env.get("HOST", "").strip() or ("0.0.0.0" if on_render else "127.0.0.1")
     port_text = env.get("PORT", "8000").strip()
     port = int(port_text) if re.fullmatch(r"[0-9]{1,5}", port_text) else 0
@@ -158,11 +271,13 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         jwks_url=jwks_url,
         resource_url=resource_url,
         scopes=scopes,
-        db_path=Path(db),
+        db_path=db_path,
         host=host,
         port=port,
         log_level=log_level,
         on_render=on_render,
+        allowed_origins=allowed_origins,
+        database_url=database_url,
     )
 
 
@@ -253,7 +368,28 @@ class McpEndpointGuard:
         await self.app(scope, receive, send_with_scope)
 
 
-def build_app(settings: Settings) -> Starlette:
+def open_store(settings: Settings) -> CardStore:
+    """Open the configured database, creating its tables if needed, and say which one."""
+    if settings.database_url is not None:
+        label = database_label(settings.database_url)
+        logger.info("Connecting to the Postgres database %s", label)
+        try:
+            store = PostgresCardStore(settings.database_url)
+        except StoreUnavailableError:
+            raise ConfigError(
+                f"Could not reach the Postgres database {label} at startup. "
+                "Check FLASHCARDS_DATABASE_URL (value not shown) and that the database is running."
+            ) from None
+        if store.created_tables:
+            logger.warning(
+                "Created the card tables in the Postgres database %s, which had none. If you expected "
+                "existing cards, check FLASHCARDS_DATABASE_URL.",
+                label,
+            )
+        else:
+            logger.info("Opened the existing card tables in the Postgres database %s", label)
+        return store
+    assert settings.db_path is not None
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
     if settings.db_path.exists():
         logger.info("Opened existing database %s", settings.db_path)
@@ -263,8 +399,14 @@ def build_app(settings: Settings) -> Starlette:
             "and whether this disk survives restarts.",
             settings.db_path,
         )
+    return SqliteCardStore(settings.db_path)
+
+
+def build_app(settings: Settings, store: CardStore | None = None) -> Starlette:
+    """The ASGI app. ``app.state.store`` is the open store, for closing at shutdown."""
+    store = store if store is not None else open_store(settings)
     mcp = create_server(
-        store=SqliteCardStore(settings.db_path),
+        store=store,
         token_verifier=JwtTokenVerifier(issuer=settings.issuer, audience=settings.resource_url, jwks_url=settings.jwks_url),
         issuer_url=settings.issuer,
         resource_url=settings.resource_url,
@@ -277,11 +419,14 @@ def build_app(settings: Settings) -> Starlette:
         # checked on its own, a restart loses nothing, and no session cap to exhaust.
         stateless_http=True,
         # Only answer requests addressed to this server's own name (DNS rebinding protection).
+        # Requests without an Origin header (most clients) always pass; one that carries an
+        # Origin must come from this server's own origin or one listed in the settings.
         transport_security=TransportSecuritySettings(
             allowed_hosts=[resource.netloc],
-            allowed_origins=[f"{resource.scheme}://{resource.netloc}"],
+            allowed_origins=[f"{resource.scheme}://{resource.netloc}", *settings.allowed_origins],
         ),
     )
+    app.state.store = store
     # /mcp/ would otherwise redirect to /mcp - behind Render's proxy, to plain http://.
     app.router.redirect_slashes = False
     # The SDK serves the protected resource metadata only at the path-specific URL;
@@ -300,6 +445,7 @@ def server_options(settings: Settings) -> dict[str, Any]:
     options: dict[str, Any] = {
         "host": settings.host,
         "port": settings.port,
+        "workers": WORKERS,
         "timeout_keep_alive": KEEP_ALIVE_SECONDS,
         "limit_concurrency": MAX_CONNECTIONS,
         "log_config": None,

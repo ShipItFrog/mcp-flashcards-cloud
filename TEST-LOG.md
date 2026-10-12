@@ -187,15 +187,86 @@ Found while preparing for and connecting the real project, and fixed before the 
 - Descope's documentation disagrees with itself about the issuer, so an issuer or audience mismatch logs what the token claimed.
 - A mistyped MCP server ID produces no error: Descope serves the project-level metadata instead. The startup comparison with the provider's metadata now stops the server and says why. Tested against the real project.
 
-## 8. Known limitations and pending
+# Step 3: Postgres storage and deployment (from 2026-10-12)
+
+## 8. Postgres storage (automated)
+
+The tests start a throwaway Postgres 18.6 server on `127.0.0.1` for the run (from `postgresql-binaries`, so no admin rights or Docker), with `psycopg` 3.3.6 and `psycopg-pool` 3.3.3, the versions the server pins. Every test that takes a store now runs twice, once on SQLite and once on Postgres, so sections 1 and 4 hold on both databases.
+
+| What is proven | Test |
+|---|---|
+| Both databases return cards with the same fields, values and types | `test_store.py::test_cards_look_the_same_in_both_databases` |
+| A refused add doesn't use up a card number | `test_store.py::test_a_refused_add_does_not_use_up_a_number` |
+| Store calls run in a worker thread, not on the event loop | `test_store.py::test_store_calls_run_off_the_event_loop` |
+| The largest card number a client may send is simply not found | `test_store.py::test_the_largest_card_number_is_simply_not_found` |
+| Four simultaneous adds for one user can't go past the card limit. Deterministic: the user's row is held until all four are queued behind it, then released | `test_store_postgres.py::test_simultaneous_adds_cannot_go_past_the_card_limit` |
+| A connection the server drops (as Neon does when it pauses) is replaced before the next request | `test_store_postgres.py::test_a_connection_dropped_by_the_server_is_replaced` |
+| A failed statement rolls the whole add back, including its card number | `test_store_postgres.py::test_a_failed_statement_rolls_back_and_uses_no_number` |
+| Startup creates the tables only when they are missing, and logs which database (name and host, never the URL) | `test_store_postgres.py::test_startup_creates_the_tables_once_and_says_which_database` |
+| The database password stays out of the logs at DEBUG level, out of startup errors (including an unreachable database), and out of `repr(settings)` | `test_store_postgres.py::test_the_database_password_stays_out_of_logs_and_errors` |
+| A bad database URL (no TLS to a remote host, not Postgres, no host, a bad port) is refused without repeating it; Render without a database URL, or both database settings at once, is refused | `test_app.py` |
+| Text with a NUL character, which Postgres can't store, is refused the same way on both databases | `test_tools.py` |
+| A database lost mid-service (the pool's connection dropped and no new one possible) ends in "unavailable", not the driver's own error | `test_store_postgres.py::test_a_database_lost_mid_service_is_reported_as_unavailable` |
+| A full disk is reported as "out of space"; too many connections, in the same SQLSTATE class, still as "unavailable" | `test_store_postgres.py::test_running_out_of_space_is_not_reported_as_a_temporary_outage` |
+| The tools turn those into "temporarily unavailable, try again in a minute" and "out of space", not a generic error | `test_tools.py::test_a_database_outage_gets_a_message_the_user_can_act_on`, `test_tools.py::test_a_full_database_is_not_reported_as_try_again_later` |
+| The pool is set up for Neon: no server-side prepared statements, a connect timeout, TCP keepalives, room for four connections | `test_store_postgres.py::test_the_pool_is_set_up_for_neon` |
+| Requests from origins listed in `FLASHCARDS_ALLOWED_ORIGINS` are served; other origins get 403 | `test_app.py::test_signed_requests_from_listed_origins_are_served` |
+| uvicorn's own `Config` runs one process even with `WEB_CONCURRENCY=2` in the environment | `test_app.py::test_one_process_whatever_web_concurrency_says` |
+| A password with unencoded `@`, `/` or `#` (which libpq would partly read as the host or database name, both logged) is refused; a percent-encoded one is fine; `hostaddr` pointing elsewhere doesn't count as local | `test_app.py` |
+| `FLASHCARDS_ALLOWED_ORIGINS` entries that could never match (a default port, a bad port, a path, a wildcard host) are refused at startup; `http://localhost:*` is kept | `test_app.py` |
+
+Result: **330 passed**, none skipped (with `FLASHCARDS_REQUIRE_PG=1`).
+
+## 9. Mutation check, step 3 (2026-10-12)
+
+The same runner, with the variants added in step 3. With a local Postgres available, the runner also requires the Postgres tests to run (a skip counts as a failure); the `pg-` variants break the Postgres store, and without a local Postgres they are reported as not run and the check fails. All 58 variants, steps 1 and 2 included, were rerun on this date.
+
+| Broken variant | Mistake it simulates | Failing tests |
+|---|---|---|
+| `app-workers-from-environment` | Let uvicorn take its number of processes from `WEB_CONCURRENCY`, which Render sets; with more than one, uvicorn refuses to start an app passed as an object | 2 |
+| `app-sqlite-allowed-on-render` | Let the server start on Render with a SQLite file that every restart wipes | 1 |
+| `app-database-url-echoed` | Put the database URL, password included, into the configuration error | 11 |
+| `app-database-url-unchecked` | Checked only the database URL's scheme: no host, port or TLS checks | 7 |
+| `app-database-url-in-repr` | Showed the database URL in `repr(settings)` | 2 |
+| `app-allowed-origins-ignored` | Ignored `FLASHCARDS_ALLOWED_ORIGINS`, so requests from a listed origin still got 403 | 11 |
+| `app-origins-not-standardized` | Accepted allowed origins that could never match a browser's `Origin` header | 8 |
+| `store-on-event-loop` | Ran store calls on the event loop, so one slow database call froze every other request | 3 |
+| `text-nul-allowed` | Let text with a NUL character through, which Postgres can't store | 8 |
+| `outage-unexplained` | Let a database outage reach the user as the SDK's generic error | 2 |
+| `pg-number-from-max` | Numbered cards from the largest number in use, so a deleted card's number could be given out again | 2 |
+| `pg-limit-checked-before-lock` | Checked the card limits before locking the user's row, so simultaneous adds could all get past them | 1 |
+| `pg-number-in-own-transaction` | Took the card number in a transaction of its own, so a refused add still used it up | 2 |
+| `pg-review-nulls-last` | Ordered by review time alone; Postgres puts never-reviewed cards last | 1 |
+| `pg-unscoped-grade` | Step 1's `unscoped-grade` in the Postgres store: one query forgot its owner filter | 9 |
+| `pg-no-connection-check` | Handed out pooled connections unchecked, so one the server had dropped failed the next request | 1 |
+| `pg-request-errors-unmapped` | Passed the driver's own error on during requests instead of "unavailable" (startup still mapped it) | 1 |
+| `pg-prepared-statements` | Left server-side prepared statements on, which work through Neon's pooler only with matching versions and settings | 1 |
+| `pg-full-as-unavailable` | Reported a full database as a passing outage ("try again in a minute") | 1 |
+
+Result: **all 58 caught**, none hung, invalid or left unrun. The 39 from steps 1 and 2 are still caught; `shared-deck` and `key-by-client-id` now fail 66 tests each, twice step 2's 33, because every store test runs on both databases. Step 1's storage variants (`unscoped-grade`, `review-ignores-time`, `unpaginated-list`) break only the SQLite store; the same tests run on Postgres, and `pg-unscoped-grade` shows they catch the missing owner filter there too. Most `pg-` variants are caught by a single test, and `pg-prepared-statements` only by a configuration check, so, as in section 2, those tests must not be removed.
+
+## 10. Code review (2026-10-12)
+
+Three AI review agents looked at the change (Postgres correctness, security and configuration with the documentation, test quality), and a second agent re-checked each finding. Fixed before committing:
+
+- **High:** a variant that ran store calls on the event loop deadlocked the concurrency test (the row lock could never be released), and the mutation runner had no timeout, so the whole check would hang. Fixed: adds wait at most 10 seconds for a row lock (`SET LOCAL lock_timeout`), the test releases the row in a `finally`, and the runner reports a hung run as invalid after 10 minutes.
+- **Medium:** the "temporarily unavailable" claim was only tested with a fake store; the real store's request path was not. Added the mid-service test and the `pg-request-errors-unmapped` variant.
+- **Medium:** the concurrency test hung instead of failing when an add failed early. Fixed with the `finally` above.
+- **Low:** a password with an unencoded `@` or `/` put part of itself into the logged host or database name; `hostaddr` could skip the TLS requirement; origins that could never match were accepted; a full disk was reported as a passing outage; no TCP keepalives or lock timeout; the connection pool logged three INFO lines per database call; the README promised cold-start behavior nobody had tested yet. All fixed or reworded.
+- **Not reproduced:** a race between `pg_terminate_backend` and the next request. Postgres processes the termination before it reads the next query.
+
+## 11. Known limitations and pending
 
 - The rate limit is kept in memory, which is fine for a single server instance. A multi-instance deployment would need a shared store.
 - The app runs without per-connection sessions; sections 1 and 4 test both protocol generations that way.
 - While the provider's key endpoint is failing, every request retries the fetch: PyJWT keeps no stale keys and has no back-off.
 - `token_type` is checked only when a token carries it. A provider that issued refresh tokens as JWTs without it would rely on the audience and one-day lifetime checks instead. Descope's access tokens carry it; whether its refresh and ID tokens for this server do hasn't been checked.
 - The two-account check in section 7 was one-way by hand (the second account saw none of the first account's cards); the other direction is covered by the automated tests only.
-- Cards are kept in SQLite. On a host without a persistent disk, such as Render's free tier, they are lost on every restart; step 3 moves them to a hosted database.
+- The Postgres tests use a local server with a direct connection. Neon's pooled connections (PgBouncer in transaction mode) are only exercised once deployed; the server avoids what that mode doesn't support (session settings, session-level locks) and turns off server-side prepared statements, which would depend on the pooler's version and settings.
+- Only the packages the server imports directly are pinned; the packages they depend on are installed at whatever version is current when Render builds.
+- The local test database uses the C locale, so the `COLLATE "C"` on the time columns (which keeps the review order independent of the database's locale) is never exercised against another locale.
+- The local server trusts every connection, so the password tests never send a password; a rejected password was not tried. The keepalive timing can't be tested locally either.
 - **Pending:**
-  - deployment, and sign-in from Claude Code and claude.ai against the deployed server;
-  - the production database;
+  - deployment to Render with a Neon database, and sign-in from Claude Code and claude.ai against the deployed server;
+  - what a request meets while a sleeping Render instance wakes (wait, an error, or a loading page);
   - retrying the key endpoint with back-off and keeping the last good keys.

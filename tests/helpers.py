@@ -22,6 +22,7 @@ from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
 from flashcards_cloud.server import create_server
+from flashcards_cloud.store import PostgresCardStore, SqliteCardStore
 
 ISSUER = "https://auth.example.test"
 BASE = "http://127.0.0.1:8000"
@@ -125,6 +126,25 @@ async def mcp_client(app, token: str, mode: str):
             modern = client.protocol_version in MODERN_PROTOCOL_VERSIONS
             assert modern == (mode == "auto"), f"mode={mode!r} negotiated {client.protocol_version!r}"
             yield client
+
+
+def empty_postgres_store(url: str) -> PostgresCardStore:
+    """A Postgres store whose tables exist and hold nothing."""
+    import psycopg
+
+    store = PostgresCardStore(url)
+    with psycopg.connect(url, autocommit=True) as conn:
+        conn.execute("TRUNCATE owners, cards")
+    return store
+
+
+def total_cards(store) -> int:
+    """Every card in the database, whoever owns it. For tests only: the stores
+    themselves have no way to count across owners."""
+    if isinstance(store, SqliteCardStore):
+        return store._conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0]
+    with store._pool.connection() as conn:
+        return conn.execute("SELECT COUNT(*) AS n FROM cards").fetchone()["n"]
 
 
 def payload(result) -> Any:

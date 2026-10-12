@@ -18,8 +18,14 @@ def main() -> None:
     logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # Without sessions the SDK logs "Terminating session: None" after every request.
     logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
+    # The connection pool logs three INFO lines for every database call.
+    logging.getLogger("psycopg.pool").setLevel(logging.WARNING)
     check_provider(settings)
-    uvicorn.run(build_app(settings), **server_options(settings))
+    app = build_app(settings)
+    try:
+        uvicorn.run(app, **server_options(settings))
+    finally:
+        app.state.store.close()
 
 
 if __name__ == "__main__":

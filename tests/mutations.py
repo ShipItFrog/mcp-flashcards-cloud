@@ -8,6 +8,8 @@ Every mutation must make at least one test fail.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import anyio
 import jwt
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -319,6 +321,149 @@ def _challenge_without_scope(mp):
     mp.setattr(A.McpEndpointGuard, "__init__", patched)
 
 
+_PG_NUMBER = (
+    "INSERT INTO owners (owner, next_no) VALUES (%s, 2)"
+    " ON CONFLICT (owner) DO UPDATE SET next_no = owners.next_no + 1 RETURNING next_no - 1 AS card_no"
+)
+
+
+def _pg_add(*, max_numbering=False, limit_before_lock=False, number_in_own_transaction=False):
+    """A Postgres add with one ordering or transaction mistake."""
+
+    def check_limits(conn, owner, question, answer, topic):
+        usage = conn.execute(
+            "SELECT COUNT(*) AS cards, COALESCE(SUM(length(question) + length(answer) + length(topic)), 0) AS chars"
+            " FROM cards WHERE owner = %s",
+            (owner,),
+        ).fetchone()
+        if usage["cards"] >= S.MAX_CARDS_PER_OWNER or usage["chars"] + len(question) + len(answer) + len(topic) > S.MAX_CHARS_PER_OWNER:
+            raise S.CardLimitError
+
+    def _add(self, owner, question, answer, topic):
+        if number_in_own_transaction:
+            with self._connection() as conn:  # committed at once, whatever happens next
+                card_no = conn.execute(_PG_NUMBER, (owner,)).fetchone()["card_no"]
+        with self._connection() as conn:
+            if limit_before_lock:
+                check_limits(conn, owner, question, answer, topic)
+            if not number_in_own_transaction:
+                card_no = conn.execute(_PG_NUMBER, (owner,)).fetchone()["card_no"]
+            if max_numbering:
+                card_no = conn.execute(
+                    "SELECT COALESCE(MAX(card_no), 0) + 1 AS n FROM cards WHERE owner = %s", (owner,)
+                ).fetchone()["n"]
+            if not limit_before_lock:
+                check_limits(conn, owner, question, answer, topic)
+            row = conn.execute(
+                "INSERT INTO cards (owner, card_no, question, answer, topic, topic_key, created_at)"
+                f" VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING {S._CARD_COLUMNS}",
+                (owner, card_no, question, answer, topic, S.topic_key(topic), S._now()),
+            ).fetchone()
+        return S._row_to_card(row)
+
+    return _add
+
+
+def _pg_review_nulls_last(self, owner, topic):
+    """Orders by review time alone: Postgres puts never-reviewed cards (NULL) last."""
+    clause, params = S._topic_clause(topic, "%s")
+    with self._connection() as conn:
+        row = conn.execute(
+            f"SELECT {S._CARD_COLUMNS} FROM cards WHERE owner = %s{clause} ORDER BY last_reviewed, card_no LIMIT 1",
+            [owner, *params],
+        ).fetchone()
+    return S._row_to_card(row) if row else None
+
+
+def _pg_record_review_unscoped(self, owner, card_no, correct):
+    """One Postgres query that forgot its owner filter."""
+    with self._connection() as conn:
+        row = conn.execute(
+            "UPDATE cards SET last_reviewed = %s, review_count = review_count + 1,"
+            " correct_count = correct_count + %s, wrong_count = wrong_count + %s"
+            f" WHERE card_no = %s RETURNING {S._CARD_COLUMNS}",
+            (S._now(), 1 if correct else 0, 0 if correct else 1, card_no),
+        ).fetchone()
+    return S._row_to_card(row) if row else None
+
+
+def _pg_request_errors_unmapped(mp):
+    """Requests hand the driver's own error on instead of StoreUnavailableError
+    (startup still maps its errors)."""
+
+    @contextmanager
+    def connection(self):
+        with self._pool.connection() as conn:
+            yield conn
+
+    mp.setattr(S.PostgresCardStore, "_connection", connection)
+
+
+def _pg_prepared_statements(mp):
+    """Leaves psycopg's server-side prepared statements on, which Neon's pooler may break."""
+    original = S.PostgresCardStore.__init__
+
+    def init(self, url):
+        original(self, url)
+        self._pool.kwargs.pop("prepare_threshold", None)
+
+    mp.setattr(S.PostgresCardStore, "__init__", init)
+
+
+def _pg_full_as_unavailable(mp):
+    """Reports a full database as a passing outage ("try again in a minute")."""
+    original = S.PostgresCardStore._mapped_errors
+
+    @contextmanager
+    def mapped(self):
+        try:
+            with original(self):
+                yield
+        except S.StoreFullError:
+            raise S.StoreUnavailableError from None
+
+    mp.setattr(S.PostgresCardStore, "_mapped_errors", mapped)
+
+
+def _pg_no_connection_check(mp):
+    """The pool hands out connections without checking them, so one the server dropped
+    (Neon pausing) fails the next request."""
+    import psycopg_pool
+
+    mp.setattr(psycopg_pool.ConnectionPool, "check_connection", staticmethod(lambda conn: None))
+
+
+def _database_url_echoed(value, errors):
+    """Puts the database URL, password and all, into the error message."""
+    if not value.startswith(("postgresql://", "postgres://")) or "sslmode=require" not in value:
+        errors.append(f"FLASHCARDS_DATABASE_URL is not usable: {value!r}")
+
+
+def _database_url_lenient(value, errors):
+    """Only checks the scheme: no host, port or TLS checks."""
+    if not value.startswith(("postgresql://", "postgres://")):
+        errors.append("FLASHCARDS_DATABASE_URL must be a postgresql:// URL (value not shown)")
+
+
+def _sqlite_allowed_on_render(mp):
+    """Lets the server start on Render with a SQLite file that every restart wipes."""
+    original = A._database
+    mp.setattr(A, "_database", lambda env, on_render, errors: original(env, False, errors))
+
+
+def _characters_unchecked(value, field):
+    """Only rejects text that isn't valid UTF-8; NUL passes and Postgres then fails."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise server.ToolError(f"{field} contains invalid characters") from None
+
+
+async def _outage_unexplained(call):
+    """A database outage reaches the user as the SDK's generic error."""
+    return await call
+
+
 class _ServerWithListen(server.MCPServer):
     """Leaves subscriptions/listen on (the SDK default)."""
 
@@ -374,4 +519,24 @@ MUTATIONS = {
     "app-stateful": lambda mp: mp.setattr(server, "MCPServer", _StatefulServer),
     "app-default-keep-alive": lambda mp: mp.setattr(A, "KEEP_ALIVE_SECONDS", 5),
     "app-no-connection-limit": lambda mp: mp.setattr(A, "MAX_CONNECTIONS", None),
+    "app-workers-from-environment": lambda mp: mp.setattr(A, "WORKERS", None),
+    "app-sqlite-allowed-on-render": _sqlite_allowed_on_render,
+    "app-database-url-echoed": lambda mp: mp.setattr(A, "_database_url", _database_url_echoed),
+    "app-database-url-unchecked": lambda mp: mp.setattr(A, "_database_url", _database_url_lenient),
+    "app-database-url-in-repr": lambda mp: mp.setattr(A.Settings, "__repr__", lambda self: f"Settings({self.database_url!r})"),
+    "app-allowed-origins-ignored": lambda mp: mp.setattr(A, "_origins", lambda env, errors: []),
+    "store-on-event-loop": lambda mp: mp.setattr(S, "anyio", _InlineAnyio),
+    "text-nul-allowed": lambda mp: mp.setattr(server, "_check_characters", _characters_unchecked),
+    "outage-unexplained": lambda mp: mp.setattr(server, "_stored", _outage_unexplained),
+    # Postgres only: run_mutations.py skips these when no local Postgres is available.
+    "pg-number-from-max": lambda mp: mp.setattr(S.PostgresCardStore, "_add", _pg_add(max_numbering=True)),
+    "pg-limit-checked-before-lock": lambda mp: mp.setattr(S.PostgresCardStore, "_add", _pg_add(limit_before_lock=True)),
+    "pg-number-in-own-transaction": lambda mp: mp.setattr(S.PostgresCardStore, "_add", _pg_add(number_in_own_transaction=True)),
+    "pg-review-nulls-last": lambda mp: mp.setattr(S.PostgresCardStore, "_least_recently_reviewed", _pg_review_nulls_last),
+    "pg-unscoped-grade": lambda mp: mp.setattr(S.PostgresCardStore, "_record_review", _pg_record_review_unscoped),
+    "pg-no-connection-check": _pg_no_connection_check,
+    "pg-request-errors-unmapped": _pg_request_errors_unmapped,
+    "pg-prepared-statements": _pg_prepared_statements,
+    "pg-full-as-unavailable": _pg_full_as_unavailable,
+    "app-origins-not-standardized": lambda mp: mp.setattr(A, "_standard_origin", lambda origin: origin),
 }

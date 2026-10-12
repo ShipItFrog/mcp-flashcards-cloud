@@ -3,7 +3,7 @@ client, fake tokens. Every test runs over every transport the server supports
 (see helpers.TRANSPORTS)."""
 
 import pytest
-from helpers import TRANSPORTS, error_text, mcp_client, payload, running_app
+from helpers import TRANSPORTS, error_text, mcp_client, payload, running_app, total_cards
 
 pytestmark = pytest.mark.anyio
 
@@ -86,7 +86,7 @@ async def test_token_without_a_subject_is_refused(store, transport):
         async with mcp_client(app, "no-subject", mode) as nobody:
             assert "Not signed in" in error_text(await nobody.call_tool("add_card", CARD))
             assert "Not signed in" in error_text(await nobody.call_tool("list_cards", {}))
-    assert store._conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0] == 0
+    assert total_cards(store) == 0
 
 
 @pytest.mark.parametrize("transport", TRANSPORTS)
